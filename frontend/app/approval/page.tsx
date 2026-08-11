@@ -1,5 +1,10 @@
 "use client";
 
+/**
+ * 阅读地图：独立的“草稿 → 人审 → 发送”页面，不复用主页研究 StateGraph。
+ * 前端维护审批视图状态；后端 /approval/start 与 /approval/decide 负责 checkpoint、生成和恢复。
+ * 核心状态机：idle → drafting → awaiting_review → edit/reject 循环 → sent 或受限终态。
+ */
 import { useState } from "react";
 import Link from "next/link";
 import ReactMarkdown from "react-markdown";
@@ -14,10 +19,11 @@ import {
   CheckCircle2,
 } from "lucide-react";
 
-// Backend API base URL — override with NEXT_PUBLIC_API_URL at build/run time.
+// 前后端契约边界：可在构建/运行时用 NEXT_PUBLIC_API_URL 指向 FastAPI。
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 type Status =
+  // status 是后端审批图的有限状态集合；isSent/reviewing 从它派生，避免额外状态漂移。
   | "idle"
   | "drafting"
   | "awaiting_review"
@@ -25,15 +31,17 @@ type Status =
   | "sent_with_unresolved_feedback";
 
 interface ApprovalResponse {
+  // /approval/start 与 /approval/decide 共用响应形状；thread_id 只在 start 返回，其他字段每轮同步。
   thread_id?: string;
   requires_input: boolean;
   draft: string;
   status: Status;
   final_output: string;
-  revision_count: number;
+  revision_count: number; // reject 重写后递增，用于显示 Revision 和后端上限提示。
 }
 
 export default function ApprovalPage() {
+  /** 审批页控制器：编辑器是局部 UI 状态，thread/status/draft 是后端工作流投影。 */
   const [task, setTask] = useState("");
   const [threadId, setThreadId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");

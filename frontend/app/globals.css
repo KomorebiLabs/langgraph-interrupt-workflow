@@ -1,8 +1,13 @@
+/*
+ * 样式阅读地图：本文件提供应用壳、消息/中断卡片、输入控件和 Markdown 排版。
+ * 组件逻辑位于 app/page.tsx 与 app/approval/page.tsx；class 名是它们之间的视觉契约。
+ */
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 @layer base {
+  /* 基础层：页面滚动行为与默认 body 色彩，不改变业务状态。 */
   html {
     scroll-behavior: smooth;
   }
@@ -13,10 +18,12 @@
 }
 
 @layer components {
+  /* 组件层：interrupt、message、choice 类对应主页的协议状态视觉语义。 */
   .chat-message {
     @apply animate-slide-up;
   }
 
+  /* 中断卡片是“暂停等待用户决定”的视觉信号，区别于普通 assistant 气泡。 */
   .interrupt-card {
     @apply bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-200 rounded-lg p-4 shadow-soft;
   }
@@ -45,10 +52,12 @@
     @apply bg-gradient-to-r from-orange-50 to-yellow-50 border border-orange-200 text-orange-900;
   }
 
+  /* 选项按钮承载后端 interrupt 的枚举 choice，不负责决定 API 路径。 */
   .option-button {
     @apply p-3 text-left rounded-lg bg-gradient-to-r from-blue-50 to-indigo-50 hover:from-blue-100 hover:to-indigo-100 border border-blue-200 transition-all duration-200 hover:shadow-soft hover:scale-[1.02];
   }
 
+  /* 组件可在 agent 工具审批时 disabled；样式本身不实现状态机。 */
   .input-field {
     @apply px-4 py-3 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent transition-all duration-200 shadow-soft text-sm;
   }
@@ -73,6 +82,7 @@
     @apply flex items-center justify-between p-4 bg-white/70 backdrop-blur-sm rounded-xl shadow-soft border border-white/30;
   }
 
+  /* choice 类显示已经送出的用户选择，避免与对话正文混淆。 */
   .choice-message {
     @apply bg-gradient-to-r from-purple-50/70 to-indigo-50/70 border border-purple-200/60 rounded-full px-3 py-1.5 max-w-fit shadow-sm backdrop-blur-sm text-xs;
   }
@@ -88,6 +98,7 @@
 }
 
 @layer utilities {
+  /* 工具层：渐变标题、mesh 背景与 prose-sm Markdown 尺寸。 */
   .text-gradient {
     @apply bg-gradient-to-r from-primary-600 to-secondary-600 bg-clip-text text-transparent;
   }
@@ -109,6 +120,7 @@
     border-width: 3px;
   }
 
+  /* 两个页面都用 prose-sm 渲染后端 Markdown，统一字号和间距。 */
   .prose-sm {
     font-size: 0.875rem;
     line-height: 1.5;

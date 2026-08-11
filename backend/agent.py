@@ -35,6 +35,17 @@ backend/agent.py - 模型驱动的工具 Agent 与 HITL 流式适配器
     stream_agent_response 的事件投影，最后看结构化输出与 CLI demo。
 """
 
+# 【对象清单】
+#   SYSTEM_PROMPT / AGENT_TOOLS：模型循环的固定提示与工具边界。
+#   ResearchSummary：可选的结构化最终输出契约。
+#   build_agent / agent：组装并导出的 Agent；agent_middleware_summary：能力报告。
+#   _pending_interrupt：把 LangGraph 中断值投影为前端可消费的审批数据。
+#   stream_agent_response：统一 start/resume 的流式事件适配器；_demo：CLI 演示入口。
+#
+# 【跨层契约】
+#   agent.py 不直接实现搜索、模型或安全策略，而是把它们装配到同一条状态图中；
+#   thread_id/checkpointer 保证中断后可恢复，state.next 是“仍需人工输入”的权威信号。
+
 from __future__ import annotations
 
 import logging
@@ -85,9 +96,15 @@ class ResearchSummary(BaseModel):
         default="medium", description="Rough confidence: low | medium | high."
     )
 
+    # 下游读取约定：普通模式看 messages[-1].content；结构化模式看
+    # state["structured_response"]，并由 stream_agent_response 在完成态序列化为 dict。
+
 
 def structured_output_enabled() -> bool:
-    """Whether AGENT_STRUCTURED_OUTPUT opts the agent into structured output."""
+    """读取结构化输出开关；只有显式 truthy 值才切换 response_format。
+
+    该开关只影响 create_agent 的输出模式，不改变工具审批或流式事件协议。
+    """
     return os.getenv("AGENT_STRUCTURED_OUTPUT", "").strip().lower() in (
         "1",
         "true",
@@ -101,7 +118,10 @@ _structured_output_enabled = structured_output_enabled
 
 
 def agent_middleware_summary() -> list[str]:
-    """Names of the middleware active on the agent, for /capabilities reporting."""
+    """返回能力报告用的 middleware 名称，不代表运行时对象本身。
+
+    顺序与 build_agent 的装配来源保持一致：guardrails → power-pack → HITL。
+    """
     names: list[str] = []
     if GuardrailMiddleware.from_env() is not None:
         names.append("guardrails")
@@ -117,6 +137,11 @@ def build_agent(
     structured: Optional[bool] = None,
 ):
     """Build a tool-using agent that requires approval before sensitive tools.
+
+    【装配契约】middleware 列表按外层到内层传入 create_agent：
+    ``guardrail → build_middleware_pack(model) → hitl``。因此请求先做内容安全，
+    再经过摘要/限制/重试/fallback，最后在真正执行工具前产生 action_requests。
+    extra_tools 与内置工具共享同一 interrupt_on 映射；不要在此边界外执行工具。
 
     Middleware stack (order matters — outermost first):
 
@@ -175,7 +200,12 @@ agent = build_agent()
 
 
 def _pending_interrupt(value: Any) -> dict:
-    """Normalize a HITLMiddleware interrupt request for the client."""
+    """把 HITL 的中断值归一化为前端审批协议。
+
+    输入通常含 ``action_requests`` 与 ``review_configs``；输出固定为
+    ``tool_requests``/``allowed``，缺失字段时采用 approve/reject 的安全默认值。
+    该函数只读投影，不修改 checkpoint 中保存的原始中断对象。
+    """
     requests = value.get("action_requests", []) if isinstance(value, dict) else []
     configs = value.get("review_configs", [{}]) if isinstance(value, dict) else [{}]
     allowed = configs[0].get("allowed_decisions", ["approve", "reject"]) if configs else [
@@ -187,6 +217,12 @@ def _pending_interrupt(value: Any) -> dict:
 
 async def stream_agent_response(graph, thread_id: str, command_input, config: Optional[dict] = None):
     """Run/resume the agent and stream progress, tokens, and a closing state.
+
+    【start/resume 数据流】
+    ``{"messages": [...]}`` 启动新轮次；``Command(resume={"decisions": [...]})``
+    回填同一 thread 的 HITL 决策。updates 中的 ``__interrupt__`` 暂存
+    ``action_requests``，收尾 state 再用 ``state.next`` 判断是否继续等待。
+    custom/messages/updates 是 LangGraph 原始流，下面只做客户端事件投影。
 
     ``command_input`` is the initial ``{"messages": [...]}`` (to start) or a
     ``Command(resume=...)`` (to resume after an approval decision).
@@ -248,6 +284,7 @@ async def stream_agent_response(graph, thread_id: str, command_input, config: Op
 
 
 def _demo(question: str) -> None:
+    """CLI-only start → interrupt → auto-approve → final-message smoke path."""
     from langgraph.checkpoint.memory import MemorySaver
     from langgraph.types import Command
 

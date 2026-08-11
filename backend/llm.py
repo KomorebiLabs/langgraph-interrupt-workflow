@@ -13,6 +13,16 @@ built-in ``MockChatModel`` so it runs end-to-end (including token streaming)
 with zero configuration. That makes the repo clone-and-run for newcomers.
 """
 
+# 【阅读地图】
+#   层级：provider-neutral LLM 适配边界。上游由 agent/graph 调用 get_llm；下游是 LangChain model。
+#   选择边界：using_mock_llm 决定离线 mock；get_llm 负责真实 provider 的环境配置与构造，
+#   初始化异常仍回退 mock。业务代码只应依赖 BaseChatModel/text_of，不依赖具体供应商。
+#
+# 【对象清单】
+#   _KNOWN_PROVIDER_KEYS：自动探测凭据；text_of：跨 provider 内容归一化；
+#   MockChatModel：支持工具调用与 token streaming 的离线工厂产物；
+#   using_mock_llm/get_llm：mock/real provider 选择与 fallback；_has_tool_result/_last_human 为 mock 辅助。
+
 from __future__ import annotations
 
 import logging
@@ -51,7 +61,12 @@ def _truthy(value: Optional[str]) -> bool:
 
 
 def text_of(content: Any) -> str:
-    """Normalize a message's ``content`` to plain text.
+    """将字符串或内容 block 列表统一为纯文本。
+
+    这是上层读取最终答案、流式 token 和工具上下文的稳定入口；thinking/tool-use
+    等非 text block 被跳过，避免把 provider 的内部块泄露为用户可见答案。
+
+    Normalize a message's ``content`` to plain text.
 
     Newer models (e.g. Gemini 3.x, Claude with thinking) return ``content`` as a
     list of typed blocks rather than a string. This flattens either form to the
@@ -91,6 +106,10 @@ def _last_human(messages: List[BaseMessage]) -> str:
 class MockChatModel(BaseChatModel):
     """A tiny offline chat model used when no provider is configured.
 
+    【mock 契约】bind_tools 只记录工具名和首个参数名；首次无 tool result 时发出
+    一次工具调用，收到 tool result 后输出 canned response。_stream 与 _generate
+    使用同一判断，因此离线模式也能走 HITL 的 action_requests/resume 路径。
+
     It produces context-aware canned responses and supports streaming so the
     full workflow runs without API keys. When tools are bound (e.g. by
     ``create_agent``), it drives one tool call and then a final answer, so the
@@ -99,6 +118,7 @@ class MockChatModel(BaseChatModel):
     """
 
     # Populated by ``bind_tools`` as a list of [tool_name, first_arg_name].
+    # 这是 mock 的最小工具协议，不是对真实 provider tool schema 的替代。
     tool_specs: list = []
 
     @property
@@ -206,7 +226,11 @@ class MockChatModel(BaseChatModel):
 
 
 def using_mock_llm() -> bool:
-    """Return True when ``get_llm`` would return the built-in mock model."""
+    """判断 provider 选择边界：显式 USE_MOCK_LLM 优先，否则无模型且无已知 key 才 mock。
+
+    只要配置了 LLM_MODEL 或任一已知凭据，就尝试真实 provider；真实构造失败仍由
+    get_llm 的防御性 fallback 保证应用可启动。
+    """
     if _truthy(os.getenv("USE_MOCK_LLM")):
         return True
     has_model = bool(os.getenv("LLM_MODEL"))
@@ -215,7 +239,12 @@ def using_mock_llm() -> bool:
 
 
 def get_llm(**overrides: Any) -> BaseChatModel:
-    """Return a chat model based on environment configuration.
+    """按环境配置构造统一的 BaseChatModel。
+
+    【配置契约】LLM_MODEL 指模型 ID，LLM_PROVIDER 可显式指定 provider，
+    LLM_TEMPERATURE 提供默认 temperature，overrides 最后覆盖环境默认值。
+    凭据由各 provider 自己读取；本工厂只负责选择/构造，不执行请求。初始化异常
+    会记录 warning 并回到 MockChatModel，形成“真实 provider → mock”开关边界。
 
     Falls back to :class:`MockChatModel` when nothing is configured or when
     initialisation fails, so the template always runs.

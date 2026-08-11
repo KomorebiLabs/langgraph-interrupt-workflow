@@ -1,5 +1,11 @@
 "use client";
 
+/**
+ * 阅读地图：这是前端研究助手的“协议适配层 + 渲染层”。
+ * 上游是用户输入、localStorage user_id 和 FastAPI 的 workflow/agent/deep API；
+ * 下游是消息、进度、interrupt 卡片、结构化摘要和 time-travel 面板。
+ * 字段名和 SSE type 是前后端契约；不要把 interrupt 误当成普通 assistant 文本。
+ */
 import { useState, useEffect, useRef } from "react";
 import Link from "next/link";
 import ReactMarkdown from "react-markdown";
@@ -24,6 +30,7 @@ import {
 } from "lucide-react";
 
 interface Message {
+  // UI 消息是用于时间戳、角色和 choice 展示的视图模型，不是后端消息的逐字段镜像。
   role: "user" | "assistant" | "system" | "choice";
   content: string;
   timestamp: Date;
@@ -31,6 +38,7 @@ interface Message {
 }
 
 interface InterruptData {
+  // workflow 通过 options 提供枚举选择，agent/deep 通过扩展字段提供 tool requests；两者共用此外壳。
   type: string;
   message: string;
   question: string;
@@ -39,6 +47,7 @@ interface InterruptData {
 }
 
 interface ChatState {
+  // workflow state 是后端 checkpoint 的前端投影，仅用于展示和导航，不取代后端快照。
   user_query: string;
   research_plan: string;
   research_results: string[];
@@ -260,6 +269,7 @@ export default function ChatInterface() {
     addMessage("choice", displayText, choiceType);
   };
 
+  /** workflow 首轮：POST /start {message,user_id} 建立 thread；返回 interrupt 或完成态 state。 */
   const startChat = async (message: string) => {
     setIsLoading(true);
     addMessage("user", message);
@@ -308,6 +318,10 @@ export default function ChatInterface() {
     }
   };
 
+  /**
+   * workflow 恢复：普通路径 POST /stream，time-travel 路径 POST /fork。
+   * progress 是并行 Send 阶段，content 是 token，state 收束状态并可能重新打开 interrupt。
+   */
   // Unified resume: streams progress (parallel research), tokens (final answer),
   // and a closing state event. `fork` resumes from a past checkpoint (time travel).
   const runResume = async (choice: string, fork?: string) => {
@@ -377,6 +391,7 @@ export default function ChatInterface() {
     }
   };
 
+  // GET /history/{thread_id} 返回 checkpoint 摘要；这里只加载 workflow 的快照历史。
   // Feature C: load checkpoint history for the current thread.
   const loadHistory = async () => {
     if (!threadId) return;
@@ -390,6 +405,7 @@ export default function ChatInterface() {
     }
   };
 
+  // 这里只标记分叉点并重开选择卡；真正分叉发生在用户选择后调用 POST /fork。
   // Feature C: rewind to a past interrupt and re-open its options to choose anew.
   const rewindTo = (checkpoint: any) => {
     const node = (checkpoint.next && checkpoint.next[0]) || "";
@@ -403,6 +419,10 @@ export default function ChatInterface() {
     });
   };
 
+  /**
+   * agent/deep 共用 SSE 状态机：state.tool_requests 非空且 requires_input=true 表示暂停在工具执行前。
+   * allowed 决定 approve/edit/respond/reject，decisions 数组原样作为后端 HITL payload。
+   */
   // ── Agent engine (create_agent + HITL middleware) ──────────────────────────
   // Shared SSE handler for both /agent/start and /agent/decide.
   const consumeAgentStream = async (
@@ -493,9 +513,11 @@ export default function ChatInterface() {
     }
   };
 
+  // agent/deep 复用同一 SSE 事件形状，只有 URL 前缀不同，审批渲染与决定 payload 不分叉。
   // The agent + deep-agent engines share one SSE handler; only the path differs.
   const agentBase = () => (engine === "deep" ? "/deep" : "/agent");
 
+  // 首轮/追问统一 POST /agent/start 或 /deep/start；threadOverride 表示继续已有会话。
   const startAgent = async (message: string, threadOverride?: string) => {
     await consumeAgentStream(`${agentBase()}/start`, {
       message,
@@ -504,6 +526,7 @@ export default function ChatInterface() {
     });
   };
 
+  // HITL 契约：{thread_id, decisions:[{type:"approve"|"edit"|"reject"|"respond", ...}]}。
   const agentDecide = async (decisions: Record<string, unknown>[]) => {
     if (!threadId) return;
     await consumeAgentStream(`${agentBase()}/decide`, {
@@ -512,6 +535,7 @@ export default function ChatInterface() {
     });
   };
 
+  // 引擎切换是新会话边界：清理 thread、interrupt、checkpoint 和 agent 专属结果。
   // Switch engines: reset the conversation so each engine starts clean.
   const switchEngine = (next: "workflow" | "agent" | "deep") => {
     if (next === engine) return;
@@ -576,6 +600,10 @@ export default function ChatInterface() {
     }
   };
 
+  /**
+   * 输入路由：无 thread → start；workflow interrupt → stream/fork；完成态 → continue；
+   * agent/deep 工具 interrupt 时禁止自由文本，只能走审批决定。
+   */
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!input.trim()) return;
@@ -636,6 +664,10 @@ export default function ChatInterface() {
 
   // Agent engine: approve / edit / reject a pending tool call.
   // State lives in the parent so it survives re-renders during streaming.
+  /**
+   * 工具审批读取 toolRequests[0]：扁平参数用字段表单，复杂参数保留 JSON 编辑；
+   * 提交动作编码为 approve、edit(edited_action)、respond(message)、reject(message)。
+   */
   const renderAgentApproval = () => {
     const req = interruptData?.agent?.toolRequests?.[0];
     const allowed: string[] = interruptData?.agent?.allowed || [];
@@ -858,6 +890,7 @@ export default function ChatInterface() {
     );
   };
 
+  // workflow interrupt 支持 string[] 或 Record 两种 options 形状，最终都作为 choice 恢复图。
   const renderInterruptOptions = () => {
     if (!interruptData?.options) return null;
 
@@ -1426,6 +1459,7 @@ export default function ChatInterface() {
           </div>
         ))}
 
+        {/* workflow interrupt：问题来自 interrupt_message，选项最终送入 /stream 或 /fork。 */}
         {/* Interrupt Options */}
         {interruptData && !interruptData.agent && (
           <div className="interrupt-card animate-slide-up">

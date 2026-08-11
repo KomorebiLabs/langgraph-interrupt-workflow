@@ -21,6 +21,16 @@ the zero-config demo is unaffected. Defaults are conservative enough that they
 never trigger during a short conversation.
 """
 
+# 【阅读地图】
+#   层级：agent.py 使用的可选 LangChain middleware 装配器；本文件不执行模型请求。
+#   输入：一个 chat model（仅供摘要 middleware）；环境变量决定各组件是否加入。
+#   输出：(middleware 实例列表, active_names 报告列表)，列表顺序就是运行时包顺序。
+#
+# 【对象清单】
+#   _truthy/_int_env：宽松解析开关与正整数限制；build_middleware_pack：唯一装配入口；
+#   active_middleware_names：仅返回能力报告。组件按摘要 → 模型限制 → 工具限制 → 重试
+#   → todo 规划 → fallback 排列；agent.py 再把 HITL 放在整个包之后。
+
 from __future__ import annotations
 
 import logging
@@ -44,6 +54,7 @@ def _truthy(value: str | None, default: bool = False) -> bool:
 
 
 def _int_env(name: str, default: int | None) -> int | None:
+    """读取正整数限制；空值走默认值，非正数表示关闭该限制。"""
     raw = os.getenv(name, "").strip()
     if raw == "":
         return default
@@ -57,6 +68,10 @@ def _int_env(name: str, default: int | None) -> int | None:
 def build_middleware_pack(model: Any) -> tuple[list, list[str]]:
     """Return ``(middleware, active_names)`` for the configured power-pack.
 
+    【顺序契约】返回列表会被 agent.py 原样插入 guardrail 与 HITL 之间；
+    因而这里的先后不仅用于展示，也决定请求/响应包装层级。默认开启摘要、
+    模型调用上限与重试；工具上限、TodoList、fallback 均是显式 opt-in。
+
     ``model`` is the chat model the summarization middleware uses to condense
     history. The returned middleware are meant to sit between the guardrail and
     the human-in-the-loop middleware in ``build_agent``.
@@ -65,6 +80,7 @@ def build_middleware_pack(model: Any) -> tuple[list, list[str]]:
     active: list[str] = []
 
     # 1) Summarization — protect against context overflow on long threads.
+    #    先压缩历史，再让后续限制/重试层处理更小的上下文。
     if _truthy(os.getenv("AGENT_SUMMARIZATION"), default=True):
         trigger_messages = _int_env("AGENT_SUMMARIZATION_TRIGGER_MESSAGES", 40) or 40
         keep_messages = _int_env("AGENT_SUMMARIZATION_KEEP_MESSAGES", 20) or 20
@@ -94,6 +110,7 @@ def build_middleware_pack(model: Any) -> tuple[list, list[str]]:
         active.append(f"tool_call_limit({tool_call_limit})")
 
     # 4) Model retry — recover from transient endpoint errors.
+    #    仅包裹模型调用；它不是 HITL 决策重试，也不会重放已执行工具。
     if _truthy(os.getenv("AGENT_MODEL_RETRY"), default=True):
         retries = _int_env("AGENT_MODEL_RETRIES", 2) or 2
         middleware.append(ModelRetryMiddleware(max_retries=retries))
@@ -107,6 +124,7 @@ def build_middleware_pack(model: Any) -> tuple[list, list[str]]:
         active.append("todo_list")
 
     # 6) Model fallback — opt-in; needs a second model id.
+    #    这里只按模型 ID 构造备用层；构造失败时保持主模型路径不变。
     fallback_model = os.getenv("AGENT_FALLBACK_MODEL", "").strip()
     if fallback_model:
         try:
@@ -121,5 +139,5 @@ def build_middleware_pack(model: Any) -> tuple[list, list[str]]:
 
 
 def active_middleware_names(model: Any) -> list[str]:
-    """Just the active-name list (for reporting in /capabilities)."""
+    """仅生成 /capabilities 的名称快照，不重复暴露 middleware 内部参数。"""
     return build_middleware_pack(model)[1]
