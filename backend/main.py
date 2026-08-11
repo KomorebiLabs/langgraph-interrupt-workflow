@@ -1,0 +1,635 @@
+"""FastAPI server exposing the LangGraph human-in-the-loop research workflow.
+
+The graph is compiled at startup with a checkpointer chosen from the
+environment:
+
+- ``CHECKPOINT_DB=checkpoints.sqlite`` → durable, resumable state via
+  ``AsyncSqliteSaver`` (survives server restarts — LangGraph's durable
+  execution feature).
+- unset → in-memory state via ``MemorySaver`` (great for local dev).
+
+No secrets are hardcoded here; configure everything through environment
+variables (see ``.env.example``).
+
+================================================================================
+backend/main.py - FastAPI 边界与 LangGraph 恢复/流式适配
+================================================================================
+
+【阅读地图】
+    上游：客户端提交 JSON、choice/approval decision；lifespan 选择 checkpointer/store。
+    下游：app.state.graph / approval_graph / agent_graph 被 endpoint 驱动；graph 文件负责
+          状态机，本文件负责线程 ID、请求校验、响应投影、SSE framing 和错误包装。
+    核心契约：thread_id 是 checkpoint 恢复主键；state.next/ __interrupt__ 决定 requires_input；
+          /stream 系列返回 data: JSON 的 SSE；approval 响应额外投影 draft/status/final_output。
+
+【系统位置】
+    HTTP request → Pydantic model → endpoint → app.state graph + thread config
+        → ainvoke(Command(resume=...)) / stream adapter → JSON snapshot or SSE
+    lifespan: build_store + optional tools → capabilities → SQLite saver 或 MemorySaver
+
+【阅读提示】
+    先看 lifespan，再看请求模型和 _interrupt_info；然后按 research、approval、agent/deep、
+    time-travel 分组阅读。test_main.py 是响应 shape 的主要消费者。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import uuid
+from contextlib import asynccontextmanager
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
+
+from agent import (
+    agent_middleware_summary,
+    build_agent,
+    stream_agent_response,
+    structured_output_enabled,
+)
+from agui import AGUI_AVAILABLE, AGUI_PATH, mount_agui
+from approval_workflow import build_approval_graph
+from graph import build_research_graph, resilience_config, stream_research_response
+from guardrails import GuardrailMiddleware
+from llm import using_mock_llm
+from mcp_tools import load_mcp_tools
+from memory import build_store, load_user_memory, save_user_memory
+
+load_dotenv()
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger(__name__)
+
+# The Deep Agent engine needs the optional ``deepagents`` package. Import it
+# gracefully so the app still boots (with the engine disabled) if it's absent.
+try:
+    from deep_agent import build_deep_agent, deep_agent_available
+
+    DEEP_AGENT_ENABLED = True
+except Exception as exc:  # pragma: no cover - only when deepagents is missing
+    logger.warning("Deep Agent engine disabled (install 'deepagents'): %s", exc)
+    DEEP_AGENT_ENABLED = False
+
+    def deep_agent_available() -> bool:
+        return False
+
+
+def _capabilities(store, mcp_tools) -> dict:
+    """构造 /capabilities 的稳定能力快照，供 UI 判断可选路径是否可用。
+
+    Reads: guardrails 环境配置、Store 的 index_config、MCP tool 列表及各引擎能力。
+    Returns: 按 model/guardrails/structured_output/semantic_memory/mcp/middleware/resilience/
+    agui/deep_agent 分组的 JSON-safe dict；这里报告能力，不启动任何 graph。
+    mock 模型下 deep_agent 可能已安装但仍 unavailable，reason 用于解释这两种状态。
+    """
+    guardrail = GuardrailMiddleware.from_env()
+    return {
+        "model": {
+            "mock": using_mock_llm(),
+            "name": None if using_mock_llm() else os.getenv("LLM_MODEL", "gpt-4o-mini"),
+        },
+        "guardrails": {
+            "enabled": guardrail is not None,
+            "redact_pii": bool(guardrail and guardrail.redact_pii),
+            "blocklist_count": len(guardrail.blocklist) if guardrail else 0,
+        },
+        "structured_output": structured_output_enabled(),
+        "semantic_memory": getattr(store, "index_config", None) is not None,
+        "mcp": {
+            "enabled": bool(mcp_tools),
+            "tools": [getattr(t, "name", "tool") for t in mcp_tools],
+        },
+        "middleware": agent_middleware_summary(),
+        "resilience": resilience_config(),
+        "agui": {"enabled": AGUI_AVAILABLE, "path": AGUI_PATH if AGUI_AVAILABLE else None},
+        "deep_agent": {
+            "installed": DEEP_AGENT_ENABLED,
+            "available": deep_agent_available(),
+            "reason": (
+                None
+                if deep_agent_available()
+                else "Deep Agent engine needs the 'deepagents' package."
+                if not DEEP_AGENT_ENABLED
+                else "Deep Agent plans and delegates to subagents — set LLM_MODEL "
+                "+ a provider key to see it in action."
+            ),
+        },
+    }
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Compile the graphs with a checkpointer (+ store for long-term memory)."""
+    # 阶段 1：创建跨 thread Store。Store 保存 user_memory，checkpointer 保存某个 thread 的可恢复 state。
+    # 阶段 2：加载可选 MCP tools，并冻结 capabilities 快照供 /capabilities 和 UI 状态条使用。
+    # 阶段 3：按 CHECKPOINT_DB 选择持久化边界；SQLite 可跨重启恢复，MemorySaver 适合本地开发。
+    # 三个引擎各自绑定同一个 saver/store，但仍由各自 endpoint 使用自己的 graph。
+    # 阶段 4：yield 交出已编译 graph；退出 async context 时释放 SQLite 资源。
+    # Cross-thread long-term memory, with semantic search when embeddings are
+    # configured (see memory.build_store). Swap for a Postgres store in prod.
+    store = build_store()
+    app.state.store = store
+
+    # Optional MCP tools — empty unless MCP_SERVERS is configured (see mcp_tools).
+    mcp_tools = await load_mcp_tools()
+
+    app.state.capabilities = _capabilities(store, mcp_tools)
+
+    def _build_agent(saver):
+        return build_agent(checkpointer=saver, store=store, extra_tools=mcp_tools)
+
+    checkpoint_db = os.getenv("CHECKPOINT_DB")
+    if checkpoint_db:
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+        logger.info("Using durable AsyncSqliteSaver at %s", checkpoint_db)
+        async with AsyncSqliteSaver.from_conn_string(checkpoint_db) as saver:
+            app.state.graph = build_research_graph(checkpointer=saver, store=store)
+            app.state.approval_graph = build_approval_graph(checkpointer=saver)
+            app.state.agent_graph = _build_agent(saver)
+            if DEEP_AGENT_ENABLED:
+                app.state.deep_agent = build_deep_agent(checkpointer=saver, store=store)
+            yield
+    else:
+        logger.info("Using in-memory MemorySaver (set CHECKPOINT_DB for durability)")
+        saver = MemorySaver()
+        app.state.graph = build_research_graph(checkpointer=saver, store=store)
+        app.state.approval_graph = build_approval_graph(checkpointer=saver)
+        app.state.agent_graph = _build_agent(saver)
+        if DEEP_AGENT_ENABLED:
+            app.state.deep_agent = build_deep_agent(checkpointer=saver, store=store)
+        yield
+
+
+app = FastAPI(title="LangGraph Interrupt Workflow Template", lifespan=lifespan)
+
+# Expose the agent over the AG-UI protocol at /agui (no-op if not installed), so
+# any AG-UI client (e.g. CopilotKit) can drive it — including the approval pause.
+mount_agui(app)
+
+_allowed_origins = os.getenv("CORS_ORIGINS", "*").split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in _allowed_origins],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# --- Request models ---------------------------------------------------------
+# 【HTTP 输入契约】
+# ChatInput/ContinueInput 的 user_id 是跨 thread memory 身份，不是 checkpoint 主键；thread_id 由后端创建。
+# ResumeInput/ForkInput 注入 choice；ForkInput 还指定历史 checkpoint；AgentDecision 是工具审批数组。
+# ApprovalDecision 的 content 只对 edit 有效，feedback 只对 reject 有效。
+class ChatInput(BaseModel):
+    message: str
+    user_id: str | None = None  # enables cross-session long-term memory
+
+
+class ResumeInput(BaseModel):
+    thread_id: str
+    choice: str
+    user_input: str | None = None
+
+
+class ContinueInput(BaseModel):
+    thread_id: str
+    message: str
+    user_id: str | None = None
+
+
+class ForkInput(BaseModel):
+    thread_id: str
+    checkpoint_id: str
+    choice: str  # the (possibly different) decision to apply at that checkpoint
+
+
+class AgentStart(BaseModel):
+    message: str
+    user_id: str | None = None
+    thread_id: str | None = None  # provide to continue an existing agent thread
+
+
+class AgentDecision(BaseModel):
+    thread_id: str
+    # One decision per pending tool call, e.g.
+    #   {"type": "approve"}
+    #   {"type": "edit", "edited_action": {"name": "web_search", "args": {...}}}
+    #   {"type": "reject", "message": "..."}  /  {"type": "respond", "message": "..."}
+    decisions: list[dict]
+
+
+class ApprovalStart(BaseModel):
+    task: str
+
+
+class ApprovalDecision(BaseModel):
+    thread_id: str
+    action: str  # "approve" | "edit" | "reject"
+    content: str | None = None  # edited draft, when action == "edit"
+    feedback: str | None = None  # change request, when action == "reject"
+
+
+# --- Helpers ----------------------------------------------------------------
+def _interrupt_info(result) -> tuple[bool, str | None]:
+    """把 LangGraph ainvoke 的 __interrupt__ 结果投影为 API 使用的二元契约。
+
+    仅在结果包含中断时返回 (True, interrupt_value)；普通完成返回 (False, None)。
+    调用者仍需读取 aget_state() 获取完整 state/next，因此该 helper 不代替 checkpoint 快照。
+    """
+    if isinstance(result, dict) and result.get("__interrupt__"):
+        return True, result["__interrupt__"][0].value
+    return False, None
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/capabilities")
+async def capabilities(request: Request):
+    """Report which optional features are active (guardrails, MCP, etc.)."""
+    return getattr(request.app.state, "capabilities", {})
+
+
+@app.post("/start")
+async def start_chat(chat_input: ChatInput, request: Request):
+    """Start a new research conversation."""
+    graph = request.app.state.graph
+    thread_id = str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
+
+    initial_state = {
+        "messages": [],
+        "user_query": chat_input.message,
+        "research_plan": "",
+        "research_results": [],
+        "sub_queries": [],
+        "analysis": "",
+        "final_response": "",
+        "current_step": "planning",
+        "requires_user_input": False,
+        "interrupt_data": None,
+        "user_choice": None,
+        "user_id": chat_input.user_id,
+        "user_memory": None,
+    }
+
+    try:
+        result = await graph.ainvoke(initial_state, config)
+        state = await graph.aget_state(config)
+        is_interrupted, interrupt_message = _interrupt_info(result)
+        return {
+            "thread_id": thread_id,
+            "state": state.values,
+            "next": state.next,
+            "requires_input": is_interrupted,
+            "interrupt_message": interrupt_message,
+        }
+    except Exception as exc:
+        logger.exception("Error starting research")
+        raise HTTPException(status_code=500, detail=f"Error starting research: {exc}")
+
+
+@app.get("/get_state/{thread_id}")
+async def get_research_state(thread_id: str, request: Request):
+    """Get the current state of a conversation."""
+    graph = request.app.state.graph
+    config = {"configurable": {"thread_id": thread_id}}
+    try:
+        state = await graph.aget_state(config)
+        if not state.values:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        is_interrupted = bool(state.next)
+        message = f"Waiting for input for {state.next[0]}..." if is_interrupted else None
+        return {
+            "state": state.values,
+            "next": state.next,
+            "requires_input": is_interrupted,
+            "interrupt_message": message,
+            "current_step": state.values.get("current_step", "unknown"),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"Error getting state: {exc}")
+
+
+@app.post("/resume")
+async def resume_research(data: ResumeInput, request: Request):
+    """Resume an interrupted conversation with the user's choice."""
+    graph = request.app.state.graph
+    config = {"configurable": {"thread_id": data.thread_id}}
+    try:
+        result = await graph.ainvoke(Command(resume=data.choice), config)
+        state = await graph.aget_state(config)
+        is_interrupted, interrupt_message = _interrupt_info(result)
+        return {
+            "state": state.values,
+            "next": state.next,
+            "requires_input": is_interrupted,
+            "interrupt_message": interrupt_message,
+            "current_step": state.values.get("current_step", "completed"),
+        }
+    except Exception as exc:
+        logger.exception("Error resuming research")
+        raise HTTPException(status_code=500, detail=f"Error resuming research: {exc}")
+
+
+@app.post("/continue")
+async def continue_conversation(data: ContinueInput, request: Request):
+    """Continue a finished conversation with a follow-up question."""
+    graph = request.app.state.graph
+    config = {"configurable": {"thread_id": data.thread_id}}
+    try:
+        current_state = await graph.aget_state(config)
+        if not current_state.values:
+            raise HTTPException(status_code=404, detail="Thread not found")
+
+        follow_up_state = {
+            "user_query": data.message,
+            "research_plan": "",
+            "research_results": [],  # reset prior findings (reset_or_append reducer)
+            "sub_queries": [],
+            "analysis": "",
+            "final_response": "",
+            "current_step": "planning",
+            "requires_user_input": False,
+            "interrupt_data": None,
+            "user_choice": None,
+            "user_id": data.user_id or current_state.values.get("user_id"),
+            "user_memory": None,
+        }
+
+        result = await graph.ainvoke(follow_up_state, config)
+        state = await graph.aget_state(config)
+        is_interrupted, interrupt_message = _interrupt_info(result)
+        return {
+            "state": state.values,
+            "next": state.next,
+            "requires_input": is_interrupted,
+            "interrupt_message": interrupt_message,
+            "current_step": state.values.get("current_step", "planning"),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Error continuing conversation")
+        raise HTTPException(status_code=500, detail=f"Error continuing conversation: {exc}")
+
+
+# --- Approval workflow (draft → approve / edit / reject → send) -------------
+def _approval_payload(state, result) -> dict:
+    """Build a response describing the current approval state."""
+    is_interrupted, interrupt_message = _interrupt_info(result)
+    return {
+        "state": state.values,
+        "next": state.next,
+        "requires_input": is_interrupted,
+        "interrupt": interrupt_message,
+        "draft": state.values.get("draft", ""),
+        "status": state.values.get("status", "unknown"),
+        "final_output": state.values.get("final_output", ""),
+        "revision_count": state.values.get("revision_count", 0),
+    }
+
+
+@app.post("/approval/start")
+async def approval_start(data: ApprovalStart, request: Request):
+    """Draft content for a task and pause for human review."""
+    graph = request.app.state.approval_graph
+    thread_id = str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
+
+    initial_state = {
+        "messages": [],
+        "task": data.task,
+        "draft": "",
+        "feedback": "",
+        "revision_count": 0,
+        "decision": "",
+        "status": "drafting",
+        "final_output": "",
+    }
+    try:
+        result = await graph.ainvoke(initial_state, config)
+        state = await graph.aget_state(config)
+        return {"thread_id": thread_id, **_approval_payload(state, result)}
+    except Exception as exc:
+        logger.exception("Error starting approval workflow")
+        raise HTTPException(status_code=500, detail=f"Error starting approval: {exc}")
+
+
+@app.post("/approval/decide")
+async def approval_decide(data: ApprovalDecision, request: Request):
+    """Resume the approval workflow with approve / edit / reject."""
+    graph = request.app.state.approval_graph
+    config = {"configurable": {"thread_id": data.thread_id}}
+
+    action = data.action.lower()
+    resume_value: dict = {"action": action}
+    if action == "edit":
+        resume_value["content"] = data.content or ""
+    elif action == "reject":
+        resume_value["feedback"] = data.feedback or ""
+
+    try:
+        result = await graph.ainvoke(Command(resume=resume_value), config)
+        state = await graph.aget_state(config)
+        return _approval_payload(state, result)
+    except Exception as exc:
+        logger.exception("Error deciding approval workflow")
+        raise HTTPException(status_code=500, detail=f"Error in approval decision: {exc}")
+
+
+def _stream_response(
+    graph, thread_id: str, choice: str, config: dict | None = None
+) -> StreamingResponse:
+    async def generate_stream():
+        async for chunk in stream_research_response(graph, thread_id, choice, config):
+            yield f"data: {json.dumps(chunk)}\n\n"
+        yield f"data: {json.dumps({'type': 'done', 'content': '', 'done': True})}\n\n"
+
+    return StreamingResponse(
+        generate_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+@app.post("/stream")
+async def stream_research(data: ResumeInput, request: Request):
+    """Resume and stream progress + the final response (SSE)."""
+    return _stream_response(request.app.state.graph, data.thread_id, data.choice)
+
+
+@app.get("/stream")
+async def stream_research_get(thread_id: str, choice: str, request: Request):
+    """Resume and stream via GET (for EventSource)."""
+    return _stream_response(request.app.state.graph, thread_id, choice)
+
+
+# --- Agent engine (create_agent + HITL middleware) --------------------------
+def _sse(generator) -> StreamingResponse:
+    async def body():
+        async for chunk in generator:
+            yield f"data: {json.dumps(chunk)}\n\n"
+
+    return StreamingResponse(
+        body(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+@app.post("/agent/start")
+async def agent_start(data: AgentStart, request: Request):
+    """Start (or continue) an agentic run; streams progress, tokens, approvals."""
+    graph = request.app.state.agent_graph
+    store = request.app.state.store
+    is_new = not data.thread_id
+    thread_id = data.thread_id or str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
+
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    messages = []
+    if is_new:
+        # Inject cross-session memory as a leading system message (first turn only).
+        memory = await load_user_memory(store, data.user_id, query=data.message)
+        if memory:
+            messages.append(SystemMessage(content=f"Remembered context:\n{memory}"))
+    messages.append(HumanMessage(content=data.message))
+
+    async def gen():
+        yield {"type": "thread", "thread_id": thread_id}
+        final_seen = ""
+        async for ev in stream_agent_response(graph, thread_id, {"messages": messages}, config):
+            if ev.get("type") == "state" and not ev.get("requires_input"):
+                final_seen = ev.get("final_response", "")
+            yield ev
+        if final_seen:
+            await save_user_memory(store, data.user_id, f"Asked the agent about: {data.message[:120]}")
+
+    return _sse(gen())
+
+
+@app.post("/agent/decide")
+async def agent_decide(data: AgentDecision, request: Request):
+    """Resume the agent with approve / edit / reject / respond decisions."""
+    graph = request.app.state.agent_graph
+    config = {"configurable": {"thread_id": data.thread_id}}
+    command = Command(resume={"decisions": data.decisions})
+    return _sse(stream_agent_response(graph, data.thread_id, command, config))
+
+
+# --- Deep Agent engine (planning + subagents + HITL) ------------------------
+@app.post("/deep/start")
+async def deep_start(data: AgentStart, request: Request):
+    """Start (or continue) a Deep Agent run; streams planning, tools, approvals.
+
+    Uses the same SSE event shape as ``/agent/*`` so the frontend reuses one
+    handler. The Deep Agent plans, delegates to subagents, and pauses for tool
+    approval — most visible with a real provider model.
+    """
+    graph = getattr(request.app.state, "deep_agent", None)
+    if graph is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Deep Agent engine is not available (install 'deepagents').",
+        )
+    store = request.app.state.store
+    is_new = not data.thread_id
+    thread_id = data.thread_id or str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
+
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    messages = []
+    if is_new:
+        memory = await load_user_memory(store, data.user_id, query=data.message)
+        if memory:
+            messages.append(SystemMessage(content=f"Remembered context:\n{memory}"))
+    messages.append(HumanMessage(content=data.message))
+
+    async def gen():
+        yield {"type": "thread", "thread_id": thread_id}
+        final_seen = ""
+        async for ev in stream_agent_response(graph, thread_id, {"messages": messages}, config):
+            if ev.get("type") == "state" and not ev.get("requires_input"):
+                final_seen = ev.get("final_response", "")
+            yield ev
+        if final_seen:
+            await save_user_memory(
+                store, data.user_id, f"Asked the deep agent about: {data.message[:120]}"
+            )
+
+    return _sse(gen())
+
+
+@app.post("/deep/decide")
+async def deep_decide(data: AgentDecision, request: Request):
+    """Resume the Deep Agent with approve / edit / reject / respond decisions."""
+    graph = getattr(request.app.state, "deep_agent", None)
+    if graph is None:
+        raise HTTPException(status_code=503, detail="Deep Agent engine is not available.")
+    config = {"configurable": {"thread_id": data.thread_id}}
+    command = Command(resume={"decisions": data.decisions})
+    return _sse(stream_agent_response(graph, data.thread_id, command, config))
+
+
+# --- Time travel (checkpoint history + fork) --------------------------------
+@app.get("/history/{thread_id}")
+async def get_history(thread_id: str, request: Request):
+    """List the checkpoints for a thread so a user can rewind / fork."""
+    graph = request.app.state.graph
+    config = {"configurable": {"thread_id": thread_id}}
+    try:
+        checkpoints = []
+        async for snap in graph.aget_state_history(config):
+            nxt = list(snap.next)
+            checkpoints.append(
+                {
+                    "checkpoint_id": snap.config.get("configurable", {}).get("checkpoint_id"),
+                    "step": (snap.metadata or {}).get("step"),
+                    "next": nxt,
+                    "has_interrupt": bool(nxt),
+                    "current_step": (snap.values or {}).get("current_step"),
+                    "user_query": (snap.values or {}).get("user_query", ""),
+                    "created_at": str(snap.created_at) if snap.created_at else None,
+                }
+            )
+        return {"thread_id": thread_id, "checkpoints": checkpoints}
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=f"Error reading history: {exc}")
+
+
+@app.post("/fork")
+async def fork_from_checkpoint(data: ForkInput, request: Request):
+    """Rewind to a past checkpoint and resume with a (possibly different) choice.
+
+    Streams the forked run just like ``/stream``. The new run branches off the
+    chosen checkpoint without losing the original history.
+    """
+    config = {
+        "configurable": {
+            "thread_id": data.thread_id,
+            "checkpoint_id": data.checkpoint_id,
+        }
+    }
+    return _stream_response(request.app.state.graph, data.thread_id, data.choice, config)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
